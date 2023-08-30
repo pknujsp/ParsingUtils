@@ -13,7 +13,6 @@ import main.OpenCV.paddingAndResize
 import main.OpenCV.toMat
 import org.opencv.core.Mat
 import org.opencv.core.Rect
-import org.opencv.imgcodecs.Imgcodecs
 import java.io.File
 import java.io.FileInputStream
 import java.util.zip.ZipInputStream
@@ -24,8 +23,6 @@ private const val LABELS_BASE_PATH = "C://Users/USER/Desktop/training/단일경�
 private const val TARGET_IMAGE_SIZE = 224
 private const val IMAGE_OUTPUT_BASE_PATH = "C://Users/USER/Desktop/training/dataset/images"
 
-private val excludedLabelFiles = mutableListOf<String>()
-
 private val JSON = Json {
     ignoreUnknownKeys = true
     coerceInputValues = true
@@ -33,10 +30,10 @@ private val JSON = Json {
 
 // dlmapping, itemSeq
 private val productCodeMap = mutableMapOf<String, String>()
-private val printFlow = Channel<String>(capacity = 2000, onBufferOverflow = BufferOverflow.SUSPEND)
+private val printFlow = Channel<String>(capacity = 3000, onBufferOverflow = BufferOverflow.SUSPEND)
 
-private val labelChannel: Channel<LabelFileInfo> = Channel(capacity = 2000, onBufferOverflow = BufferOverflow.SUSPEND)
-private val imageChannel: Channel<ImageInfo> = Channel(capacity = 2000, onBufferOverflow = BufferOverflow.SUSPEND)
+private val labelChannel: Channel<LabelFileInfo> = Channel(capacity = 3000, onBufferOverflow = BufferOverflow.SUSPEND)
+private val imageChannel: Channel<ImageInfo> = Channel(capacity = 3000, onBufferOverflow = BufferOverflow.SUSPEND)
 
 @OptIn(ExperimentalSerializationApi::class)
 private fun loadProductCodes() {
@@ -75,14 +72,19 @@ private suspend fun processAndSave(imageInfo: ImageInfo) {
         if (!exists()) mkdirs()
     }
 
-    Imgcodecs.imwrite("${path}/${imageInfo.outputImageFileName}", resizedMat)
+    //Imgcodecs.imwrite("${path}/${imageInfo.outputImageFileName}", resizedMat)
     printFlow.send("사진 처리 후 저장완료 : ${imageInfo.outputImageFileName}")
+}
+
+private fun existsImageFile(itemSeq: String, fileName: String): Boolean {
+    val name = fileName.replace("json", "jpg")
+    return File("${IMAGE_OUTPUT_BASE_PATH}/${itemSeq}/${name}").exists()
 }
 
 private fun String.toMappingCode() = split("/").first()
 
 suspend fun main(): Unit = supervisorScope {
-    launch(Dispatchers.IO) {
+    val printJob = launch(Dispatchers.IO) {
         printFlow.consumeAsFlow().collect {
             println(it)
         }
@@ -95,20 +97,26 @@ suspend fun main(): Unit = supervisorScope {
             val file = File("${LABELS_BASE_PATH}/${it.itemSeq}/${it.labelFileName}")
 
             if (file.exists()) {
-                val label = JSON.decodeFromString(
-                    AiHubLabelEntity.serializer(), file.readText()
-                ).item()
+                if (existsImageFile(it.itemSeq, it.labelFileName)) {
+                    printFlow.send("이미 존재하는 사진 : ${it.labelFileName}")
+                } else {
+                    val label = JSON.decodeFromString(
+                        AiHubLabelEntity.serializer(), file.readText()
+                    ).item()
 
-                imageChannel.send(ImageInfo(mat = it.imageByte.toMat(), bbox = label.second.run {
-                    Rect(x, y, width, height)
-                }, itemSeq = label.first.itemSeq.toString(), srcImageFileName = file.nameWithoutExtension))
-            } else {
-                excludedLabelFiles.add(file.name)
+                    imageChannel.send(ImageInfo(mat = it.imageByte.toMat(), bbox = label.second.run {
+                        Rect(x, y, width, height)
+                    }, itemSeq = label.first.itemSeq.toString(), srcImageFileName = file.nameWithoutExtension))
+                }
             }
         }
+
+    }
+    labelingJob.invokeOnCompletion {
+        println("작업 완료")
     }
 
-    launch(Dispatchers.IO) {
+    val imageProcessingJob = launch(Dispatchers.IO) {
         imageChannel.consumeAsFlow().collect {
             processAndSave(it)
         }
@@ -140,9 +148,11 @@ suspend fun main(): Unit = supervisorScope {
         }
     }
 
-    labelingJob.invokeOnCompletion {
-        File("C://Users/USER/Desktop/training/학습데이터/제외된파일.txt").writeText(excludedLabelFiles.joinToString("\n"))
-    }
+    println("작업 완료 대기중...")
+    printJob.join()
+    imageProcessingJob.join()
+
+
 }
 
 private class LabelFileInfo(
