@@ -1,11 +1,11 @@
 package main.imagenet.aihub
 
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.consumeAsFlow
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.json.Json
 import main.OpenCV.crop
@@ -13,12 +13,17 @@ import main.OpenCV.paddingAndResize
 import main.OpenCV.toMat
 import org.opencv.core.Mat
 import org.opencv.core.Rect
+import org.opencv.imgcodecs.Imgcodecs
 import java.io.File
 import java.io.FileInputStream
 import java.util.zip.ZipInputStream
 import kotlin.io.path.Path
+import kotlin.io.path.exists
 
-private const val ZIP_PATH = "E://166.약품식별 인공지능 개발을 위한 경구약제 이미지 데이터/01.데이터/1.Training/원천데이터/단일경구약제 5000종/zips"
+private val ZIP_PATH = listOf(
+    "E://166.약품식별 인공지능 개발을 위한 경구약제 이미지 데이터/01.데이터/1.Training/원천데이터/단일경구약제 5000종/zips",
+    "D://166.약품식별 인공지능 개발을 위한 경구약제 이미지 데이터/01.데이터/1.Training/원천데이터/단일경구약제 5000종"
+)
 private const val LABELS_BASE_PATH = "C://Users/USER/Desktop/training/단일경구약제 5000종"
 private const val TARGET_IMAGE_SIZE = 224
 private const val IMAGE_OUTPUT_BASE_PATH = "C://Users/USER/Desktop/training/dataset/images"
@@ -28,8 +33,11 @@ private val JSON = Json {
     coerceInputValues = true
 }
 
+private val mutex = Mutex()
+
 // dlmapping, itemSeq
 private val productCodeMap = mutableMapOf<String, String>()
+private val finalLabelsMap = mutableMapOf<String, Set<String>>()
 private val printFlow = Channel<String>(capacity = 3000, onBufferOverflow = BufferOverflow.SUSPEND)
 
 private val labelChannel: Channel<LabelFileInfo> = Channel(capacity = 3000, onBufferOverflow = BufferOverflow.SUSPEND)
@@ -61,6 +69,11 @@ private fun loadProductCodes() {
             productCodeMap.putAll(dlMap)
         }
 
+    JSON.decodeFromString(
+        FinalLabelEntity.serializer(), File("C://Users/USER/Desktop/training/dataset/final_label.json").readText()
+    ).run {
+        finalLabelsMap.putAll(filesMap)
+    }
 }
 
 private suspend fun processAndSave(imageInfo: ImageInfo) {
@@ -72,22 +85,25 @@ private suspend fun processAndSave(imageInfo: ImageInfo) {
         if (!exists()) mkdirs()
     }
 
-    //Imgcodecs.imwrite("${path}/${imageInfo.outputImageFileName}", resizedMat)
+    Imgcodecs.imwrite("${path}/${imageInfo.outputImageFileName}", resizedMat)
     printFlow.send("사진 처리 후 저장완료 : ${imageInfo.outputImageFileName}")
 }
 
 private fun existsImageFile(itemSeq: String, fileName: String): Boolean {
-    val name = fileName.replace("json", "jpg")
-    return File("${IMAGE_OUTPUT_BASE_PATH}/${itemSeq}/${name}").exists()
+    return Path("${IMAGE_OUTPUT_BASE_PATH}/${itemSeq}/${fileName}").exists()
 }
 
 private fun String.toMappingCode() = split("/").first()
 
+@OptIn(DelicateCoroutinesApi::class)
 suspend fun main(): Unit = supervisorScope {
-    val printJob = launch(Dispatchers.IO) {
+    val printJob = launch(Dispatchers.Default) {
         printFlow.consumeAsFlow().collect {
             println(it)
         }
+    }
+    printJob.invokeOnCompletion {
+        println("출력 작업 완료")
     }
 
     loadProductCodes()
@@ -97,23 +113,19 @@ suspend fun main(): Unit = supervisorScope {
             val file = File("${LABELS_BASE_PATH}/${it.itemSeq}/${it.labelFileName}")
 
             if (file.exists()) {
-                if (existsImageFile(it.itemSeq, it.labelFileName)) {
-                    printFlow.send("이미 존재하는 사진 : ${it.labelFileName}")
-                } else {
-                    val label = JSON.decodeFromString(
-                        AiHubLabelEntity.serializer(), file.readText()
-                    ).item()
+                val label = JSON.decodeFromString(
+                    AiHubLabelEntity.serializer(), file.readText()
+                ).item()
 
-                    imageChannel.send(ImageInfo(mat = it.imageByte.toMat(), bbox = label.second.run {
-                        Rect(x, y, width, height)
-                    }, itemSeq = label.first.itemSeq.toString(), srcImageFileName = file.nameWithoutExtension))
-                }
+                imageChannel.send(ImageInfo(mat = it.imageByte.toMat(), bbox = label.second.run {
+                    Rect(x, y, width, height)
+                }, itemSeq = label.first.itemSeq.toString(), srcImageFileName = file.nameWithoutExtension))
             }
         }
 
     }
     labelingJob.invokeOnCompletion {
-        println("작업 완료")
+        println("라벨링 파일 분석 작업 완료")
     }
 
     val imageProcessingJob = launch(Dispatchers.IO) {
@@ -121,38 +133,60 @@ suspend fun main(): Unit = supervisorScope {
             processAndSave(it)
         }
     }
+    imageProcessingJob.invokeOnCompletion {
+        println("이미지 처리 작업 완료")
+    }
 
-    val zips = Path(ZIP_PATH).toFile().listFiles()!!.filter { it.extension == "zip" }
+    val zips = ZIP_PATH.flatMap { s -> Path(s).toFile().listFiles()!!.filter { it.extension == "zip" } }
+    val recordFile = File("C:\\Users\\USER\\Desktop\\training\\dataset\\record.txt")
 
-    for (zip in zips) {
-        try {
-            ZipInputStream(FileInputStream(zip)).use { zipInput ->
-                var entry = zipInput.nextEntry
-                while (entry != null) {
-                    if (!entry.isDirectory) {
-                        zipInput.readAllBytes()?.let { bytes ->
-                            labelChannel.send(
-                                LabelFileInfo(
-                                    itemSeq = productCodeMap[entry!!.name.toMappingCode()]!!,
-                                    pLabelFileName = entry!!.name,
-                                    imageByte = bytes
+    val unzipJobs = zips.mapIndexed { zipNum, zip ->
+        async(Dispatchers.IO) {
+            try {
+                ZipInputStream(FileInputStream(zip)).use { zipInput ->
+                    var entry = zipInput.nextEntry
+                    while (entry != null) {
+                        if (!entry.isDirectory) {
+                            if (existsImageFile(
+                                    productCodeMap[entry.name.toMappingCode()]!!,
+                                    entry.name.split("/")[1].replace("png", "jpg")
                                 )
-                            )
+                            ) {
+                                printFlow.send("이미 존재하는 사진 : $zipNum, ${entry.name}")
+                            } else {
+                                zipInput.readAllBytes()?.let { bytes ->
+                                    labelChannel.send(
+                                        LabelFileInfo(
+                                            itemSeq = productCodeMap[entry!!.name.toMappingCode()]!!,
+                                            pLabelFileName = entry!!.name,
+                                            imageByte = bytes
+                                        )
+                                    )
+                                }
+                            }
                         }
+                        entry = zipInput.nextEntry
                     }
-                    entry = zipInput.nextEntry
                 }
+
+                mutex.withLock {
+                    recordFile.run {
+                        if (!exists()) createNewFile()
+                        appendText("처리 완료 : ${zip.name}\n")
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
         }
+    }
+    unzipJobs.forEach {
+        it.await()
     }
 
     println("작업 완료 대기중...")
     printJob.join()
     imageProcessingJob.join()
-
-
 }
 
 private class LabelFileInfo(
