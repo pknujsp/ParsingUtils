@@ -18,6 +18,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.util.zip.ZipInputStream
 import kotlin.io.path.Path
+import kotlin.io.path.createDirectories
 import kotlin.io.path.exists
 
 private val ZIP_PATH = listOf(
@@ -77,17 +78,20 @@ private fun loadProductCodes() {
 }
 
 private suspend fun processAndSave(imageInfo: ImageInfo) {
-    val bboxMat = imageInfo.mat.crop(imageInfo.bbox)
-    val resizedMat = bboxMat.paddingAndResize(TARGET_IMAGE_SIZE)
+    if (existsImageFile(
+            imageInfo.itemSeq, imageInfo.outputImageFileName
+        )
+    ) {
+        printFlow.send("중복 : ${imageInfo.outputImageFileName}")
+    } else {
+        val bboxMat = imageInfo.mat.crop(imageInfo.bbox)
+        val resizedMat = bboxMat.paddingAndResize(TARGET_IMAGE_SIZE)
 
-    val path = "${IMAGE_OUTPUT_BASE_PATH}/${imageInfo.itemSeq}"
-    File(path).apply {
-        if (!exists()) mkdirs()
+        Imgcodecs.imwrite("${IMAGE_OUTPUT_BASE_PATH}/${imageInfo.itemSeq}/${imageInfo.outputImageFileName}", resizedMat)
+        printFlow.send("사진 처리 후 저장완료 : ${imageInfo.outputImageFileName}")
     }
-
-    Imgcodecs.imwrite("${path}/${imageInfo.outputImageFileName}", resizedMat)
-    printFlow.send("사진 처리 후 저장완료 : ${imageInfo.outputImageFileName}")
 }
+
 
 private fun existsImageFile(itemSeq: String, fileName: String): Boolean {
     return Path("${IMAGE_OUTPUT_BASE_PATH}/${itemSeq}/${fileName}").exists()
@@ -107,6 +111,9 @@ suspend fun main(): Unit = supervisorScope {
     }
 
     loadProductCodes()
+    val completedProducts = File("C://Users/USER/Desktop/training/dataset/completed.txt").run {
+        readLines().toSet()
+    }
 
     val labelingJob = launch(Dispatchers.IO) {
         labelChannel.consumeAsFlow().collect {
@@ -145,16 +152,11 @@ suspend fun main(): Unit = supervisorScope {
         try {
             ZipInputStream(FileInputStream(zip)).use { zipInput ->
                 var entry = zipInput.nextEntry
+                var skip = false
+
                 while (entry != null) {
                     if (!entry.isDirectory) {
-                        if (existsImageFile(
-                                productCodeMap[entry.name.toMappingCode()]!!,
-                                entry.name.split("/")[1].replace("png", "jpg")
-                            )
-                        ) {
-                            printFlow.send("이미 존재하는 사진 : $zipsCount -> $zipNum, ${entry.name}")
-                        } else {
-                            printFlow.send("처리해야할 사진 : $zipsCount -> $zipNum, ${entry.name}")
+                        if (!skip) {
                             zipInput.readAllBytes()?.let { bytes ->
                                 labelChannel.send(
                                     LabelFileInfo(
@@ -163,6 +165,19 @@ suspend fun main(): Unit = supervisorScope {
                                         imageByte = bytes
                                     )
                                 )
+                            }
+                        }
+                    } else {
+                        val itemSeq = productCodeMap.getOrDefault(entry.name.toMappingCode(), "")
+                        if (itemSeq.isEmpty()) {
+                            skip = true
+                        } else {
+                            Path("${IMAGE_OUTPUT_BASE_PATH}/${itemSeq}").run {
+                                if (!exists()) createDirectories()
+                            }
+                            skip = completedProducts.contains(itemSeq)
+                            if (skip) {
+                                printFlow.send("생략 : ${entry.name}")
                             }
                         }
                     }
@@ -181,7 +196,7 @@ suspend fun main(): Unit = supervisorScope {
             mutex.withLock {
                 recordFile.run {
                     if (!exists()) createNewFile()
-                    appendText("오류 : ${zip.name} -> ${e.printStackTrace()}\n")
+                    appendText("오류 : ${zip.name} -> ${e.message}\n")
                 }
             }
         }
