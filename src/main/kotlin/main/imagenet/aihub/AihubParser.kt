@@ -139,49 +139,52 @@ suspend fun main(): Unit = supervisorScope {
 
     val zips = ZIP_PATH.flatMap { s -> Path(s).toFile().listFiles()!!.filter { it.extension == "zip" } }
     val recordFile = File("C:\\Users\\USER\\Desktop\\training\\dataset\\record.txt")
+    val zipsCount = zips.size
 
-    val unzipJobs = zips.mapIndexed { zipNum, zip ->
-        async(Dispatchers.IO) {
-            try {
-                ZipInputStream(FileInputStream(zip)).use { zipInput ->
-                    var entry = zipInput.nextEntry
-                    while (entry != null) {
-                        if (!entry.isDirectory) {
-                            if (existsImageFile(
-                                    productCodeMap[entry.name.toMappingCode()]!!,
-                                    entry.name.split("/")[1].replace("png", "jpg")
-                                )
-                            ) {
-                                printFlow.send("이미 존재하는 사진 : $zipNum, ${entry.name}")
-                            } else {
-                                zipInput.readAllBytes()?.let { bytes ->
-                                    labelChannel.send(
-                                        LabelFileInfo(
-                                            itemSeq = productCodeMap[entry!!.name.toMappingCode()]!!,
-                                            pLabelFileName = entry!!.name,
-                                            imageByte = bytes
-                                        )
+    zips.mapIndexed { zipNum, zip ->
+        try {
+            ZipInputStream(FileInputStream(zip)).use { zipInput ->
+                var entry = zipInput.nextEntry
+                while (entry != null) {
+                    if (!entry.isDirectory) {
+                        if (existsImageFile(
+                                productCodeMap[entry.name.toMappingCode()]!!,
+                                entry.name.split("/")[1].replace("png", "jpg")
+                            )
+                        ) {
+                            printFlow.send("이미 존재하는 사진 : $zipsCount -> $zipNum, ${entry.name}")
+                        } else {
+                            printFlow.send("처리해야할 사진 : $zipsCount -> $zipNum, ${entry.name}")
+                            zipInput.readAllBytes()?.let { bytes ->
+                                labelChannel.send(
+                                    LabelFileInfo(
+                                        itemSeq = productCodeMap[entry!!.name.toMappingCode()]!!,
+                                        pLabelFileName = entry!!.name,
+                                        imageByte = bytes
                                     )
-                                }
+                                )
                             }
                         }
-                        entry = zipInput.nextEntry
                     }
+                    entry = zipInput.nextEntry
                 }
+            }
 
-                mutex.withLock {
-                    recordFile.run {
-                        if (!exists()) createNewFile()
-                        appendText("처리 완료 : ${zip.name}\n")
-                    }
+            mutex.withLock {
+                recordFile.run {
+                    if (!exists()) createNewFile()
+                    appendText("처리 완료 : ${zip.name}\n")
                 }
-            } catch (e: Exception) {
-                e.printStackTrace()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            mutex.withLock {
+                recordFile.run {
+                    if (!exists()) createNewFile()
+                    appendText("오류 : ${zip.name} -> ${e.printStackTrace()}\n")
+                }
             }
         }
-    }
-    unzipJobs.forEach {
-        it.await()
     }
 
     println("작업 완료 대기중...")
